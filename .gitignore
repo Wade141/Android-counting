@@ -1,0 +1,61 @@
+# Android and Gradle build output
+.gradle/
+.gradle-user-home/
+.gradle-review/
+.kotlin/
+**/build/
+
+# Local Android SDK and device tooling
+local.properties
+.android-adb/
+.android-sdk-home/
+
+# IDE metadata
+.idea/
+*.iml
+
+# Native build and captures
+.externalNativeBuild/
+.cxx/
+captures/
+
+# Superpowers execution scratch and local worktrees
+.superpowers/
+.worktrees/
+worktrees/
+
+# Local backup archives
+.backups/
+
+# Credentials, signing material and local personal data
+.env
+.env.*
+!.env.example
+*.jks
+*.keystore
+*.pem
+*.key
+*.p12
+*.pfx
+key.properties
+keystore.properties
+secrets.properties
+google-services.json
+service-account*.json
+credentials*.json
+*.db
+*.db-*
+*.sqlite
+*.sqlite3
+*.log
+*.apk
+*.aab
+*.hprof
+/private/
+/private-data/
+/screenshots/
+/exports/
+
+# Internal development notes and private screenshot fixtures
+/docs/
+/app/src/testDebug/
