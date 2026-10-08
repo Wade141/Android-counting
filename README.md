@@ -46,8 +46,7 @@
 
 欢迎通过 [Issues](https://github.com/Wade141/Android-counting/issues) 反馈问题或提出建议。
 
-反馈时可以说明手机型号、Android 版本、操作步骤，以及预期和实际发生的情况。如需附上截图，请先遮挡姓名、手机号、账号、交易单号等个人信息。
-
+反馈时可以说明手机型号、Android 版本、操作步骤，以及预期和实际发生的情况。
 <details>
 <summary>开发者说明</summary>
 
