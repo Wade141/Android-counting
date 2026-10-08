@@ -8,7 +8,7 @@
 
 一款帮助记录日常开销、查看消费和管理预算的 Android 记账应用。
 
-**这是一个个人开发和维护的项目。** 在这里分享项目源码，方便大家了解、体验和交流。欢迎提出建议。
+**这是一个新手个人开发和维护的项目。** 而且本人对kotlin还需深入学习，可能会出现意想不到的问题，但至少目前已经在个人设备的IQOO 12 PRO上稳定运行了两个月了，望轻喷
 
 ## 用途
 
@@ -53,19 +53,3 @@
 项目使用 Kotlin、Jetpack Compose 和 SQLite，采用本地中文 OCR 模型。
 
 使用 Android Studio 打开项目，配置 Android SDK（API 35）并完成 Gradle 同步后，即可运行 app。建议使用 Android Studio 自带的 JDK。首次构建需要联网下载依赖。
-
-Windows 构建命令：
-
-    .\gradlew.bat :app:assembleDebug
-
-macOS / Linux 构建命令：
-
-    ./gradlew :app:assembleDebug
-
-单元测试：
-
-    .\gradlew.bat :app:testDebugUnitTest
-
-本地 SDK 配置、签名密钥、访问令牌和个人数据不应提交到仓库。公开版本未包含使用私人付款截图的 OCR 回放测试。
-
-</details>
