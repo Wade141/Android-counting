@@ -46,6 +46,7 @@ import org.junit.Test
 
 @OptIn(ExperimentalCoroutinesApi::class)
 class ExpenseViewModelTest {
+    private val testCoordinators = mutableMapOf<ExpenseViewModel, ForegroundPersistenceCoordinator>()
     @get:Rule
     val mainDispatcherRule = MainDispatcherRule()
 
@@ -1327,6 +1328,24 @@ class ExpenseViewModelTest {
             NotificationListenerConnectionState.CONNECTED,
             viewModel.uiState.value.notificationState
         )
+    }
+
+    @Test
+    fun cancellingScopeWhileSavedMutationWaitsForRefreshClearsItsPending() = runTest {
+        val repository = FakeExpenseRepository().apply { homeSnapshot = sampleHomeSnapshot(expenseId = 92L) }
+        val viewModel = createViewModel(repository = repository, ioDispatcher = UnconfinedTestDispatcher(testScheduler))
+        viewModel.refresh(NotificationListenerConnectionState.CONNECTED)
+        advanceUntilIdle()
+        val gate = CompletableDeferred<Unit>()
+        repository.loadHomeSnapshotGates += gate
+        viewModel.submitNewExpense(NewExpenseInput(100L, "FOOD", "午餐", ""))
+        runCurrent()
+        assertEquals(2, repository.loadHomeSnapshotCalls)
+        assertTrue(viewModel.uiState.value.pending.entrySaving)
+        viewModel.viewModelScope.cancel()
+        advanceUntilIdle()
+        assertFalse(viewModel.uiState.value.pending.entrySaving)
+        gate.complete(Unit)
     }
 
     @Test
@@ -2700,6 +2719,28 @@ class ExpenseViewModelTest {
     }
 
     @Test
+    fun failedDocumentEventEnqueueClearsPendingAndCannotCompleteNextExport() = runTest {
+        val vm = createViewModel(FakeExpenseRepository(), ioDispatcher = UnconfinedTestDispatcher(testScheduler))
+        // No collector: fill the existing bounded event channel with ordinary messages.
+        repeat(1000) { vm.importReadFailed() }
+        val failedWriteId = requireNotNull(vm.prepareExport(BackupExportFormat.JSON, "content://full"))
+        advanceUntilIdle()
+        assertFalse(vm.uiState.value.pending.exportPreparing)
+        val events = mutableListOf<UiEvent>()
+        backgroundScope.launch(UnconfinedTestDispatcher(testScheduler)) { vm.events.toList(events) }
+        assertTrue(events.none { it is UiEvent.WriteDocument })
+
+        val currentWriteId = requireNotNull(vm.prepareExport(BackupExportFormat.JSON, "content://ready"))
+        advanceUntilIdle()
+        assertTrue(vm.uiState.value.pending.exportPreparing)
+        assertEquals(currentWriteId, events.filterIsInstance<UiEvent.WriteDocument>().single().writeId)
+        vm.documentWriteCompleted(failedWriteId, true)
+        assertTrue(vm.uiState.value.pending.exportPreparing)
+        vm.documentWriteCompleted(currentWriteId, true)
+        assertFalse(vm.uiState.value.pending.exportPreparing)
+    }
+
+    @Test
     fun confirmRestoreSynchronouslyInvalidatesQueuedIntentsAndObsoleteUi() = runTest {
         val repository = FakeExpenseRepository().apply {
             homeSnapshot = sampleHomeSnapshot(expenseId = 80L)
@@ -2730,8 +2771,14 @@ class ExpenseViewModelTest {
         viewModel.setAlipayEnabled(false)
         viewModel.prepareExport(BackupExportFormat.JSON, "content://queued.json")
 
+        val restoreStates = mutableListOf<ExpenseUiState>()
+        backgroundScope.launch(UnconfinedTestDispatcher(testScheduler)) {
+            viewModel.uiState.collect { restoreStates += it }
+        }
+        restoreStates.clear()
         viewModel.confirmRestore()
 
+        assertEquals("Restore reset must publish a single complete UI state", 1, restoreStates.size)
         val admittedState = viewModel.uiState.value
         assertTrue(viewModel.coordinatorForTest().isRestoring)
         assertTrue(admittedState.pending.restoring)
@@ -3093,6 +3140,64 @@ class ExpenseViewModelTest {
     }
 
     @Test
+    fun observedSnapshotsNeverMixRestoredEpochWithOldLedgerDuringQueuedRefresh() = runTest {
+        val oldReadGate = CompletableDeferred<Unit>()
+        val restoredReadGate = CompletableDeferred<Unit>()
+        val fake = FakeExpenseRepository().apply { homeSnapshot = sampleHomeSnapshot(801L) }
+        var reads = 0
+        val repository = object : ExpenseRepositoryContract by fake {
+            override suspend fun loadHomeSnapshot(now: LocalDate, zoneId: java.time.ZoneId): ExpenseHomeSnapshot {
+                val captured = fake.homeSnapshot
+                when (++reads) {
+                    2 -> oldReadGate.await()
+                    3 -> restoredReadGate.await()
+                }
+                return captured
+            }
+
+            override suspend fun refreshHomeSnapshot(now: LocalDate, zoneId: java.time.ZoneId,
+                previous: ExpenseHomeSnapshot, domains: Set<com.example.monthlyexpense.data.DataDomain>) =
+                loadHomeSnapshot(now, zoneId)
+        }
+        val backup = FakeExpenseBackupManager().apply {
+            restoreResult = ExpenseBackupSettings(700L, true, false, true)
+        }
+        val coordinator = ForegroundPersistenceCoordinator(ForegroundSettingsBaseline(false, true, true))
+        val vm = ExpenseViewModel(repository, backup, SavedStateHandle(),
+            UnconfinedTestDispatcher(testScheduler), coordinator = coordinator)
+        val observed = mutableListOf<ExpenseUiState>()
+        backgroundScope.launch(UnconfinedTestDispatcher(testScheduler)) { vm.uiState.toList(observed) }
+        vm.refresh(NotificationListenerConnectionState.CONNECTED)
+        advanceUntilIdle()
+        vm.acceptImportJson("valid-backup")
+        advanceUntilIdle()
+        vm.refresh(NotificationListenerConnectionState.CONNECTED)
+        runCurrent()
+        assertEquals(2, reads)
+
+        vm.confirmRestore()
+        assertTrue(vm.uiState.value.pending.restoring)
+        assertEquals(0L, vm.uiState.value.displayedDataEpoch)
+        fake.homeSnapshot = sampleHomeSnapshot(802L)
+        oldReadGate.complete(Unit)
+        runCurrent()
+        assertEquals(3, reads)
+        assertEquals(listOf(801L), vm.uiState.value.expenses.map { it.id })
+        assertEquals(0L, vm.uiState.value.displayedDataEpoch)
+
+        restoredReadGate.complete(Unit)
+        advanceUntilIdle()
+        assertEquals(1L, coordinator.currentEpoch)
+        assertEquals(1L, vm.uiState.value.displayedDataEpoch)
+        assertEquals(listOf(802L), vm.uiState.value.expenses.map { it.id })
+        assertTrue(observed.any { it.pending.restoring })
+        assertTrue(observed.filter { it.initialLoadComplete }.all {
+            (it.displayedDataEpoch == 0L && it.expenses.map { row -> row.id } == listOf(801L)) ||
+                (it.displayedDataEpoch == 1L && it.expenses.map { row -> row.id } == listOf(802L))
+        })
+    }
+
+    @Test
     fun snapshotCommitAndDisplayedEpochAreAtomicAgainstRestoreAdmission() {
         val coordinator = ForegroundPersistenceCoordinator(
             ForegroundSettingsBaseline(
@@ -3135,25 +3240,96 @@ class ExpenseViewModelTest {
         assertEquals(1L, coordinator.currentEpoch)
     }
 
+    @Test
+    fun actualRestoreReusingExpenseIdRejectsQueuedEditAndDeleteButAcceptsFreshEditor() = runTest {
+        for (delete in listOf(false, true)) {
+            val fake = FakeExpenseRepository().apply { homeSnapshot = sampleHomeSnapshot(7) }
+            val coordinator = ForegroundPersistenceCoordinator(ForegroundSettingsBaseline(false, true, true))
+            var writes = 0
+            val repository = object : ExpenseRepositoryContract by fake {
+                override suspend fun updateExpense(id: Long, name: String, note: String, categoryKey: String,
+                    date: LocalDate?, time: java.time.LocalTime?): Boolean {
+                    writes++
+                    fake.homeSnapshot = fake.homeSnapshot.copy(expenses = fake.homeSnapshot.expenses.map {
+                        if (it.id == id) it.copy(name = name) else it
+                    })
+                    return true
+                }
+                override suspend fun deleteExpense(id: Long) {
+                    writes++
+                    fake.homeSnapshot = fake.homeSnapshot.copy(expenses = fake.homeSnapshot.expenses.filterNot { it.id == id })
+                }
+            }
+            val backup = object : com.example.monthlyexpense.backup.ExpenseBackupContract by FakeExpenseBackupManager() {
+                override fun restoreDetailed(json: String): com.example.monthlyexpense.backup.BackupRestoreResult {
+                    fake.homeSnapshot = fake.homeSnapshot.copy(expenses = listOf(fake.homeSnapshot.expenses.single().copy(name = "恢复后的同 ID 账单")))
+                    return com.example.monthlyexpense.backup.BackupRestoreResult.Completed(ExpenseBackupSettings(0, false, true, true))
+                }
+            }
+            val vm = ExpenseViewModel(repository, backup, SavedStateHandle(), StandardTestDispatcher(testScheduler), coordinator = coordinator)
+            try {
+                vm.refresh(NotificationListenerConnectionState.CONNECTED); advanceUntilIdle()
+                vm.acceptImportJson("valid-backup"); advanceUntilIdle()
+                val blocker = CompletableDeferred<Unit>()
+                val holding = launch { coordinator.runMutation(coordinator.mutationTicket()!!) { blocker.await() } }
+                runCurrent()
+                if (delete) vm.deleteExpense(7) else vm.updateExpense(7, ExpenseEditInput("过期写入", "", "FOOD"))
+                runCurrent(); assertTrue(vm.uiState.value.pending.expenseEditSaving)
+                vm.confirmRestore()
+                assertTrue(vm.uiState.value.pending.restoring); assertFalse(vm.uiState.value.pending.expenseEditSaving)
+                blocker.complete(Unit); holding.join(); advanceUntilIdle()
+                assertEquals(0, writes); assertEquals(1L, vm.uiState.value.displayedDataEpoch)
+                assertEquals("恢复后的同 ID 账单", vm.uiState.value.expenses.single().name)
+                vm.showOverlay(ExpenseOverlay.EditExpense(7))
+                vm.updateExpense(7, ExpenseEditInput("恢复后的合法编辑", "", "FOOD")); advanceUntilIdle()
+                assertEquals(1, writes); assertEquals("恢复后的合法编辑", vm.uiState.value.expenses.single().name)
+                assertNull(vm.uiState.value.overlay); assertFalse(vm.uiState.value.pending.expenseEditSaving)
+            } finally { vm.viewModelScope.cancel() }
+        }
+    }
+
+    @Test
+    fun backupPayloadsNeverEnterSavedStateAndResubscribingDoesNotReplayDocument() = runTest {
+        val saved = SavedStateHandle()
+        val backup = FakeExpenseBackupManager().apply { jsonExport = "private-document" }
+        val vm = createViewModel(FakeExpenseRepository(), backup, saved, StandardTestDispatcher(testScheduler))
+        try {
+            vm.acceptImportJson("private-restore-payload"); advanceUntilIdle()
+            val document = backgroundScope.async(UnconfinedTestDispatcher(testScheduler)) { vm.events.first() }
+            val id = vm.prepareExport(BackupExportFormat.JSON, "content://private-uri")!!; advanceUntilIdle()
+            assertEquals(UiEvent.WriteDocument(id, "content://private-uri", "private-document"), document.await())
+            assertTrue(saved.keys().isEmpty())
+            val resumed = backgroundScope.async(UnconfinedTestDispatcher(testScheduler)) { vm.events.first() }
+            runCurrent(); assertFalse(resumed.isCompleted)
+            vm.documentWriteCompleted(id, true); vm.documentWriteCompleted(id, true); advanceUntilIdle()
+            assertEquals(UiEvent.ShowMessage(UiMessage("JSON 备份已导出")), resumed.await())
+            assertEquals(1, backup.jsonExportCalls); assertTrue(saved.keys().isEmpty())
+            val fresh = createViewModel(FakeExpenseRepository(), backup, saved, StandardTestDispatcher(testScheduler))
+            try {
+                fresh.confirmRestore(); advanceUntilIdle()
+                assertNull(fresh.uiState.value.overlay); assertEquals(0, backup.restoreCalls)
+                assertFalse(fresh.uiState.value.pending.exportPreparing); assertTrue(saved.keys().isEmpty())
+            } finally { fresh.viewModelScope.cancel() }
+        } finally { vm.viewModelScope.cancel() }
+    }
+
     private fun createViewModel(
         repository: ExpenseRepositoryContract,
         backupManager: FakeExpenseBackupManager = FakeExpenseBackupManager(),
         savedStateHandle: SavedStateHandle = SavedStateHandle(),
         ioDispatcher: CoroutineDispatcher,
-        today: () -> LocalDate = LocalDate::now
+        today: () -> LocalDate = LocalDate::now,
+        coordinator: ForegroundPersistenceCoordinator = ForegroundPersistenceCoordinator(ForegroundSettingsBaseline(false, true, true))
     ): ExpenseViewModel = ExpenseViewModel(
         repository = repository,
         backupManager = backupManager,
         savedStateHandle = savedStateHandle,
         ioDispatcher = ioDispatcher,
-        today = today
-    )
+        today = today,
+        coordinator = coordinator
+    ).also { testCoordinators[it] = coordinator }
 
-    private fun ExpenseViewModel.coordinatorForTest(): ForegroundPersistenceCoordinator {
-        val field = ExpenseViewModel::class.java.getDeclaredField("coordinator")
-        field.isAccessible = true
-        return field.get(this) as ForegroundPersistenceCoordinator
-    }
+    private fun ExpenseViewModel.coordinatorForTest(): ForegroundPersistenceCoordinator = requireNotNull(testCoordinators[this])
 
     private fun sampleHomeSnapshot(
         expenseId: Long,

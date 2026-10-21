@@ -1,8 +1,14 @@
 package com.example.monthlyexpense.search
 
-import com.example.monthlyexpense.ExpenseOverlay
-import com.example.monthlyexpense.ExpenseUiState
-import com.example.monthlyexpense.data.*
+import com.example.monthlyexpense.data.CoordinatedMutation
+import com.example.monthlyexpense.data.DataDomain
+import com.example.monthlyexpense.data.ForegroundPersistenceCoordinator
+import com.example.monthlyexpense.data.ForegroundReadTicket
+import com.example.monthlyexpense.presentation.contracts.SliceState
+import com.example.monthlyexpense.search.api.SearchEditorNavigation
+import com.example.monthlyexpense.search.api.SearchNavigation
+import com.example.monthlyexpense.search.api.SearchReadPort
+import com.example.monthlyexpense.search.api.SearchInvalidation
 import java.time.LocalDate
 import java.time.ZoneId
 import kotlinx.coroutines.*
@@ -10,10 +16,12 @@ import kotlinx.coroutines.*
 /** Scheduling stays on the ViewModel's main scope; SQLite work is dispatched by the repository. */
 internal class ExpenseSearchController(
     private val scope: CoroutineScope,
-    private val repository: ExpenseRepositoryContract,
+    private val reads: SearchReadPort,
     private val coordinator: ForegroundPersistenceCoordinator,
-    private val state: () -> ExpenseUiState,
-    private val update: ((ExpenseUiState) -> ExpenseUiState) -> Unit,
+    private val state: SliceState<ExpenseSearchUiState>,
+    private val isVisible: () -> Boolean,
+    private val navigation: SearchNavigation,
+    private val editorNavigation: SearchEditorNavigation,
     private val today: () -> LocalDate,
     private val zone: () -> ZoneId
 ) {
@@ -26,23 +34,25 @@ internal class ExpenseSearchController(
     private var zoneId = zone()
     private data class Request(val generation: Long, val query: ExpenseSearchQuery,
         val cursor: ExpenseSearchCursor?, val ticket: ForegroundReadTicket)
-    private val search get() = state().search
-    private val visible get() = state().overlay == ExpenseOverlay.Search || search.editingExpense != null
-    private fun change(block: (ExpenseSearchUiState) -> ExpenseSearchUiState) = update { it.copy(search = block(it.search)) }
+    private val search get() = state.value
+    private val visible get() = isVisible()
+    private fun change(block: (ExpenseSearchUiState) -> ExpenseSearchUiState) = state.update(block)
 
     fun open() {
         date = today(); zoneId = zone()
-        update { it.copy(overlay = ExpenseOverlay.Search, search = it.search.copy(editingExpense = null, isComposing = false)) }
+        navigation.openSearch()
         invalidate(clear = true)
         firstPage()
     }
     fun close() {
         invalidate(clear = false)
-        update { it.copy(overlay = null, search = it.search.copy(filterDraft = null, editingExpense = null, isComposing = false)) }
+        navigation.closeSearchIfCurrent()
     }
-    fun resetForRestore() {
-        invalidate(clear = true)
-        update { it.copy(search = ExpenseSearchUiState()) }
+    // The host publishes the restore reset atomically with the other slices.
+    fun invalidateForRestore(): SearchInvalidation {
+        val detached = debounce
+        generation++; debounce = null; pending = null; currentQuery = null
+        return SearchInvalidation { detached?.cancel() }
     }
     private fun invalidate(clear: Boolean) {
         generation++; debounce?.cancel(); debounce = null; pending = null; currentQuery = null
@@ -119,11 +129,10 @@ internal class ExpenseSearchController(
     fun edit(id: Long) {
         if (!search.canEdit || search.dirty || coordinator.mutationTicket(search.displayedDataEpoch) == null) return
         val expense = search.items.firstOrNull { it.id == id } ?: return
-        update { it.copy(overlay = ExpenseOverlay.EditExpense(id),
-            search = it.search.copy(editingExpense = SearchEditSnapshot(expense, it.search.displayedDataEpoch))) }
+        editorNavigation.open(SearchEditSnapshot(expense, search.displayedDataEpoch))
     }
     fun returnFromEdit() {
-        update { it.copy(overlay = ExpenseOverlay.Search, search = it.search.copy(editingExpense = null)) }
+        editorNavigation.returnToSearch()
         if (search.dirty && !search.loading) firstPage()
     }
     private fun enqueue(query: ExpenseSearchQuery, cursor: ExpenseSearchCursor?) {
@@ -148,7 +157,7 @@ internal class ExpenseSearchController(
     private suspend fun execute(request: Request) {
         try {
             val result = coordinator.runRead(request.ticket) {
-                repository.loadSearchPage(request.query, request.cursor)
+                reads.loadSearchPage(request.query, request.cursor)
             }
             if (result is CoordinatedMutation.Executed && isCurrent(request)) {
                 coordinator.commitReadIfCurrent(request.ticket) { epoch ->

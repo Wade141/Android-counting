@@ -140,6 +140,37 @@ class ExpenseSearchViewModelTest {
             vm.openSearchExpense(1); assertEquals(ExpenseOverlay.Search,vm.uiState.value.overlay)
         } finally { vm.viewModelScope.cancel() }
     }
+    @Test fun actualRestoreClearsSearchAtomicallyAndRejectsOldReadAndPendingKeyword() = runTest {
+        val gate = CompletableDeferred<Unit>()
+        val keywords = mutableListOf<String>()
+        val coordinator = ForegroundPersistenceCoordinator(ForegroundSettingsBaseline(false, true, true))
+        val repo = object : ExpenseRepositoryContract by FakeExpenseRepository() {
+            override suspend fun loadSearchPage(query: ExpenseSearchQuery, cursor: ExpenseSearchCursor?, limit: Int): ExpenseSearchPage {
+                keywords += query.keyword; gate.await(); return page(99)
+            }
+        }
+        val backup = FakeExpenseBackupManager().apply { validateJsonResult = true; restoreResult = null }
+        val vm = ExpenseViewModel(repo, backup, SavedStateHandle(), StandardTestDispatcher(testScheduler), coordinator = coordinator)
+        try {
+            vm.acceptImportJson("valid-backup"); advanceUntilIdle()
+            vm.openSearch(); runCurrent()
+            vm.setSearchKeyword("queued", false); vm.submitSearch(); runCurrent()
+            vm.setSearchKeyword("debounced", false)
+            val samples = mutableListOf<ExpenseUiState>()
+            backgroundScope.launch(UnconfinedTestDispatcher(testScheduler)) { vm.uiState.collect { samples += it } }
+            samples.clear()
+            vm.confirmRestore()
+            assertEquals(1, samples.size)
+            assertEquals(ExpenseSearchUiState(), samples.single().search)
+            assertTrue(samples.single().pending.restoring); assertNull(samples.single().overlay)
+            gate.complete(Unit); advanceUntilIdle()
+            assertEquals(listOf(""), keywords)
+            assertEquals(ExpenseSearchUiState(), vm.uiState.value.search)
+            assertFalse(vm.uiState.value.pending.restoring)
+            assertEquals(1L, vm.uiState.value.displayedDataEpoch)
+        } finally { vm.viewModelScope.cancel() }
+    }
+
     @Test fun searchEditReturnsToSearchWithoutDependingOnHomeRows() = runTest {
         val fake=FakeExpenseRepository().apply { homeSnapshot=homeSnapshot.copy(categories=listOf(category)) }
         val repo=object: ExpenseRepositoryContract by fake {
